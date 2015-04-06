@@ -177,7 +177,7 @@ def compute_epochs_csd(epochs, mode='multitaper', fmin=0, fmax=np.inf,
             mt_adaptive = False
     elif mode == 'fourier':
         logger.info('    using FFT with a Hanning window to estimate spectra')
-        window_fun = np.hanning(n_times)
+        window_fun = np.hanning(n_times)[np.newaxis, :]
         mt_adaptive = False
         eigvals = 1.
         n_tapers = None

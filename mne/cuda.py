@@ -4,22 +4,16 @@
 
 import numpy as np
 from scipy.fftpack import fft, ifft
-try:
-    import pycuda.gpuarray as gpuarray
-    from pycuda.driver import mem_get_info
-    from scikits.cuda import fft as cudafft
-except (ImportError, OSError):
-    # need OSError because scikits.cuda throws it if cufft not found
-    pass
 
 from .utils import sizeof_fmt, logger
 
 
 # Support CUDA for FFTs; requires scikits.cuda and pycuda
 cuda_capable = False
-cuda_multiply_inplace_c128 = None
-cuda_halve_c128 = None
-cuda_real_c128 = None
+cuda_multiply_inplace_c128 = cuda_halve_c128 = cuda_real_c128 = \
+    cuda_mat_vec_multiply_f64 = None
+
+_block = (16, 1, 1)
 
 
 def init_cuda():
@@ -34,25 +28,25 @@ def init_cuda():
     importing mne. If this variable is not set, this function can
     be manually executed.
     """
-    global cuda_capable
-    global cuda_multiply_inplace_c128
-    global cuda_halve_c128
-    global cuda_real_c128
+    global cuda_capable, cuda_multiply_inplace_c128, cuda_halve_c128, \
+        cuda_real_c128, cuda_mat_vec_multiply_f64
     if cuda_capable is True:
+        from pycuda.driver import mem_get_info
         logger.info('CUDA previously enabled, currently %s available memory'
                     % sizeof_fmt(mem_get_info()[0]))
         return
     # Triage possible errors for informative messaging
     cuda_capable = False
     try:
-        import pycuda.gpuarray
-        import pycuda.driver
+        import pycuda.gpuarray as gpuarray  # noqa, analysis:ignore
+        from pycuda.driver import mem_get_info
+        from pycuda import compiler
     except ImportError:
         logger.warning('module pycuda not found, CUDA not enabled')
         return
     try:
         # Initialize CUDA; happens with importing autoinit
-        import pycuda.autoinit  # noqa
+        import pycuda.autoinit  # noqa, analysis:ignore
     except ImportError:
         logger.warning('pycuda.autoinit could not be imported, likely '
                        'a hardware error, CUDA not enabled')
@@ -76,6 +70,22 @@ def init_cuda():
         'pycuda::complex<double> *a', 'a[i] /= 2.0', 'halve_value')
     cuda_real_c128 = ElementwiseKernel(
         'pycuda::complex<double> *a', 'a[i] = real(a[i])', 'real_value')
+
+    _mat_vec_elwise_code = """
+    __global__ void MatVecKernel(int *n_rows, int *n_cols,
+                                 double *mat, double *vec, double *out)
+    {
+        int ci = threadIdx.x + blockDim.x * blockIdx.x;
+        int ri = threadIdx.y + blockDim.y * blockIdx.y;
+        int nr = n_rows[0];
+        int nc = n_cols[0];
+        if ( ( ci < nc ) && ( ri < nr ) ) {
+            out[ri * nc + ci] = mat[ri * nc + ci] * vec[ci];
+        }
+    }
+    """
+    cuda_mat_vec_multiply_f64 = compiler.SourceModule(
+        _mat_vec_elwise_code).get_function("MatVecKernel")
 
     # Make sure we can use 64-bit FFTs
     try:
@@ -141,6 +151,8 @@ def setup_cuda_fft_multiply_repeated(n_jobs, h_fft):
     if n_jobs == 'cuda':
         n_jobs = 1
         if cuda_capable:
+            import pycuda.gpuarray as gpuarray  # noqa, analysis:ignore
+            from scikits.cuda import fft as cudafft
             # set up all arrays necessary for CUDA
             # try setting up for float64
             try:
@@ -183,8 +195,9 @@ def fft_multiply_repeated(h_fft, x, cuda_dict=dict(use_cuda=False)):
     """
     if not cuda_dict['use_cuda']:
         # do the fourier-domain operations
-        x = np.real(ifft(h_fft * fft(x), overwrite_x=True)).ravel()
+        x = ifft(h_fft * fft(x), overwrite_x=True).ravel()
     else:
+        from scikits.cuda import fft as cudafft
         # do the fourier-domain operations, results in second param
         cuda_dict['x'].set(x.astype(np.float64))
         cudafft.fft(cuda_dict['x'], cuda_dict['x_fft'], cuda_dict['fft_plan'])
@@ -195,6 +208,116 @@ def fft_multiply_repeated(h_fft, x, cuda_dict=dict(use_cuda=False)):
                      cuda_dict['ifft_plan'], False)
         x = np.array(cuda_dict['x'].get(), dtype=x.dtype, subok=True,
                      copy=False)
+    return x
+
+
+###############################################################################
+# Repeated Window + FFT
+
+def setup_cuda_window_fft(n_jobs, windows):
+    """Set up repeated CUDA windowing plus FFT
+
+    Parameters
+    ----------
+    n_jobs : int | str
+        If n_jobs == 'cuda', the function will attempt to set up for CUDA
+        FFT multiplication.
+    windows : array
+        The windowing functions that will be used repeatedly.
+
+    Returns
+    -------
+    n_jobs : int
+        Sets n_jobs = 1 if n_jobs == 'cuda' was passed in, otherwise
+        original n_jobs is passed.
+    cuda_dict : dict
+        Dictionary with the following CUDA-related variables:
+            use_cuda : bool
+                Whether CUDA should be used.
+            fft_plan : instance of FFTPlan
+                FFT plan to use in calculating the FFT.
+            x_fft : instance of gpuarray
+                Empty allocated GPU space for storing the result of the
+                frequency-domain multiplication.
+            x : instance of gpuarray
+                Empty allocated GPU space for the data to filter.
+    windows : array | instance of gpuarray
+        This will either be a gpuarray (if CUDA enabled) or np.ndarray.
+        If CUDA is enabled, h_fft will be modified appropriately for use
+        with filter.fft_multiply().
+
+    Notes
+    -----
+    This function is designed to be used with window_fft_repeated().
+    """
+    cuda_dict = dict(use_cuda=False, fft_plan=None, ifft_plan=None,
+                     x_fft=None, x=None)
+    n_windows, n_times = windows.shape
+    cuda_fft_len = int((n_times - (n_times % 2)) / 2 + 1)
+    if n_jobs == 'cuda':
+        n_jobs = 1
+        if cuda_capable:
+            import pycuda.gpuarray as gpuarray  # noqa, analysis:ignore
+            from scikits.cuda import fft as cudafft
+            # set up all arrays necessary for CUDA
+            try:
+                dx, mx = divmod(n_times, _block[0])
+                dy, my = divmod(n_windows, _block[1])
+                grid = ((dx + (mx > 0)) * _block[0],
+                        (dy + (my > 0)) * _block[1])
+                nr = gpuarray.to_gpu(np.array(n_windows, np.int32))
+                nc = gpuarray.to_gpu(np.array(n_times, np.int32))
+                windows = gpuarray.to_gpu(windows.astype(np.float64))
+                cuda_dict.update(
+                    use_cuda=True, nr=nr, nc=nc, grid=grid,
+                    fft_plan=cudafft.Plan(n_times, np.float64, np.complex128,
+                                          n_windows),
+                    x_fft=gpuarray.empty((n_windows, cuda_fft_len),
+                                         np.complex128),
+                    x=gpuarray.empty(n_times, np.float64),
+                    x_win=gpuarray.empty((n_windows, n_times), np.float64)
+                )
+                logger.info('Using CUDA for windowed FFT')
+            except Exception:
+                logger.info('CUDA not used, could not instantiate memory '
+                            '(arrays may be too large), falling back to '
+                            'n_jobs=1')
+        else:
+            logger.info('CUDA not used, CUDA has not been initialized, '
+                        'falling back to n_jobs=1')
+    return n_jobs, cuda_dict, windows
+
+
+def window_fft_repeated(x, windows, cuda_dict=dict(use_cuda=False)):
+    """Do multiplication by window functions then FFT (possibly using CUDA)
+
+    Parameters
+    ----------
+    x : 1-d array
+        The array to process.
+    cuda_dict : dict
+        Dictionary constructed using setup_cuda_window_fft_repeated().
+
+    Returns
+    -------
+    x : 2-d array
+        FFT of the windowed version of x.
+    """
+    if not cuda_dict['use_cuda']:
+        # do the fourier-domain operations
+        x = fft(x[np.newaxis, :] * windows)[:, :len(x) // 2 + 1]
+    else:
+        from scikits.cuda import fft as cudafft
+        # do the fourier-domain operations, results in second param
+        cuda_dict['x'].set(x)
+        cuda_mat_vec_multiply_f64(cuda_dict['nr'], cuda_dict['nc'],
+                                  windows, cuda_dict['x'],
+                                  cuda_dict['x_win'], block=_block,
+                                  grid=cuda_dict['grid'])
+        cudafft.fft(cuda_dict['x_win'], cuda_dict['x_fft'],
+                    cuda_dict['fft_plan'])
+        x = np.array(cuda_dict['x_fft'].get(), dtype=np.complex128,
+                     subok=True, copy=False)
     return x
 
 
@@ -250,6 +373,8 @@ def setup_cuda_fft_resample(n_jobs, W, new_len):
     cuda_fft_len_x = int((n_fft_x - (n_fft_x % 2)) // 2 + 1)
     cuda_fft_len_y = int((n_fft_y - (n_fft_y % 2)) // 2 + 1)
     if n_jobs == 'cuda':
+        import pycuda.gpuarray as gpuarray  # noqa, analysis:ignore
+        from scikits.cuda import fft as cudafft
         n_jobs = 1
         if cuda_capable:
             # try setting up for float64
@@ -314,6 +439,7 @@ def fft_resample(x, W, new_len, npad, to_remove,
         y_fft[sl_2] = x_fft[sl_2]
         y = np.real(ifft(y_fft, overwrite_x=True)).ravel()
     else:
+        from scikits.cuda import fft as cudafft
         cuda_dict['x'].set(np.concatenate((x, np.zeros(max(new_len - old_len,
                                                            0), x.dtype))))
         # do the fourier-domain operations, results put in second param
@@ -352,5 +478,5 @@ def _smart_pad(x, n_pad):
     """
     # need to pad with zeros if len(x) <= npad
     z_pad = np.zeros(max(n_pad - len(x) + 1, 0), dtype=x.dtype)
-    return np.r_[z_pad, 2 * x[0] - x[n_pad:0:-1], x,
-                 2 * x[-1] - x[-2:-n_pad - 2:-1], z_pad]
+    return np.concatenate([z_pad, 2 * x[0] - x[n_pad:0:-1], x,
+                           2 * x[-1] - x[-2:-n_pad - 2:-1], z_pad])

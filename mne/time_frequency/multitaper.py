@@ -10,6 +10,7 @@ import warnings
 
 from ..parallel import parallel_func
 from ..utils import verbose, sum_squared
+from ..externals.six import string_types
 
 
 def tridisolve(d, e, b, overwrite_b=True):
@@ -114,18 +115,20 @@ def dpss_windows(N, half_nbw, Kmax, low_bias=True, interp_from=None,
     Parameters
     ----------
     N : int
-        Sequence length
+        Sequence length.
     half_nbw : float, unitless
         Standardized half bandwidth corresponding to 2 * half_bw = BW*f0
-        = BW*N/dt but with dt taken as 1
+        = BW*N/dt but with dt taken as 1.
     Kmax : int
-        Number of DPSS windows to return is Kmax (orders 0 through Kmax-1)
+        Number of DPSS windows to return is Kmax (orders 0 through Kmax-1).
     low_bias : Bool
         Keep only tapers with eigenvalues > 0.9
-    interp_from : int (optional)
+    interp_from : int | str | None (optional)
         The dpss can be calculated using interpolation from a set of dpss
         with the same NW and Kmax, but shorter N. This is the length of this
-        shorter set of dpss windows.
+        shorter set of dpss windows. Can also be "auto" to automatically
+        determine if interpolation should be used. If None, don't use
+        interpolation.
     interp_kind : str (optional)
         This input variable is passed to scipy.interpolate.interp1d and
         specifies the kind of interpolation as a string ('linear', 'nearest',
@@ -150,6 +153,11 @@ def dpss_windows(N, half_nbw, Kmax, low_bias=True, interp_from=None,
     Kmax = int(Kmax)
     W = float(half_nbw) / N
     nidx = np.arange(N, dtype='d')
+    if isinstance(interp_from, string_types):
+        if interp_from != 'auto':
+            raise ValueError('interp_from must be "auto" or an integer')
+        n_needed = Kmax * 1000
+        interp_from = n_needed if N > n_needed else None
 
     # In this case, we create the dpss windows of the smaller size
     # (interp_from) and then interpolate to the larger size (N)
@@ -432,21 +440,14 @@ def _mt_spectra(x, dpss, sfreq, n_fft=None):
     freqs : array
         The frequency points in Hz of the spectra
     """
-
-    if n_fft is None:
-        n_fft = x.shape[1]
+    n_fft = x.shape[1] if n_fft is None else int(n_fft)
 
     # remove mean (do not use in-place subtraction as it may modify input x)
     x = x - np.mean(x, axis=-1)[:, np.newaxis]
-    x_mt = fftpack.fft(x[:, np.newaxis, :] * dpss, n=n_fft)
-
-    # only keep positive frequencies
-    freqs = fftpack.fftfreq(n_fft, 1. / sfreq)
-    freq_mask = (freqs >= 0)
-
-    x_mt = x_mt[:, :, freq_mask]
-    freqs = freqs[freq_mask]
-
+    # do the calculation and only keep the positive freqs
+    n_freqs = (n_fft // 2 + 1)
+    x_mt = fftpack.fft(x[:, np.newaxis, :] * dpss, n=n_fft)[:, :, :n_freqs]
+    freqs = np.arange(n_fft // 2 + 1, dtype=float) * sfreq / float(n_fft)
     return x_mt, freqs
 
 
@@ -509,7 +510,7 @@ def multitaper_psd(x, sfreq=2 * np.pi, fmin=0, fmax=np.inf, bandwidth=None,
     n_tapers_max = int(2 * half_nbw)
 
     dpss, eigvals = dpss_windows(n_times, half_nbw, n_tapers_max,
-                                 low_bias=low_bias)
+                                 low_bias=low_bias, interp_from='auto')
 
     # compute the tapered spectra
     x_mt, freqs = _mt_spectra(x_in, dpss, sfreq)

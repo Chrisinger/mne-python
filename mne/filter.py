@@ -114,7 +114,7 @@ def _overlap_add_filter(x, h, n_fft=None, zero_phase=True, picks=None,
         warnings.warn("FFT length is not a power of 2. Can be slower.")
 
     # Filter in frequency domain
-    h_fft = fft(np.r_[h, np.zeros(n_fft - n_h, dtype=h.dtype)])
+    h_fft = fft(np.concatenate([h, np.zeros(n_fft - n_h, dtype=h.dtype)]))
 
     if zero_phase:
         # We will apply the filter in forward and backward direction: Scale
@@ -159,17 +159,19 @@ def _1d_overlap_filter(x, h_fft, n_edge, n_fft, zero_phase, n_segments, n_seg,
     filter_input = x_ext
     x_filtered = np.zeros_like(filter_input)
 
-    for pass_no in list(range(2)) if zero_phase else list(range(1)):
+    for pass_no in list(range(2 if zero_phase else 1)):
 
         if pass_no == 1:
             # second pass: flip signal
-            filter_input = np.flipud(x_filtered)
+            filter_input = x_filtered[::-1]
             x_filtered = np.zeros_like(x_ext)
 
         for seg_idx in range(n_segments):
             seg = filter_input[seg_idx * n_seg:(seg_idx + 1) * n_seg]
-            seg = np.r_[seg, np.zeros(n_fft - len(seg))]
+            seg = np.concatenate([seg, np.zeros(n_fft - len(seg), seg.dtype)])
             prod = fft_multiply_repeated(h_fft, seg, cuda_dict)
+            if x.dtype == np.float64:
+                prod = prod.real
             if seg_idx * n_seg + n_fft < n_x:
                 x_filtered[seg_idx * n_seg:seg_idx * n_seg + n_fft] += prod
             else:
@@ -179,11 +181,8 @@ def _1d_overlap_filter(x, h_fft, n_edge, n_fft, zero_phase, n_segments, n_seg,
     # Remove mirrored edges that we added
     x_filtered = x_filtered[n_edge - 1:-n_edge + 1]
 
-    if zero_phase:
-        # flip signal back
-        x_filtered = np.flipud(x_filtered)
-
-    x_filtered = x_filtered.astype(x.dtype)
+    # flip signal back
+    x_filtered = x_filtered[::-1] if zero_phase else x_filtered
     return x_filtered
 
 
@@ -201,14 +200,14 @@ def _filter_attenuation(h, freq, gain):
     return att_db, att_freq
 
 
-def _1d_fftmult_ext(x, B, extend_x, cuda_dict):
+def _1d_fftmult_ext(x, H, extend_x, cuda_dict):
     """Helper to parallelize FFT FIR, with extension if necessary"""
     # extend, if necessary
     if extend_x is True:
-        x = np.r_[x, x[-1]]
+        x = np.concatenate([x, [x[-1]]])
 
     # do Fourier transforms
-    xf = fft_multiply_repeated(B, x, cuda_dict)
+    xf = fft_multiply_repeated(H, x, cuda_dict).real
 
     # put back to original size and type
     if extend_x is True:
@@ -308,26 +307,26 @@ def _filter(x, Fs, freq, gain, filter_length='10s', picks=None, n_jobs=1,
 
         N = x.shape[1] + (extend_x is True)
 
-        H = firwin2(N, freq, gain)[np.newaxis, :]
+        h = firwin2(N, freq, gain)[np.newaxis, :]
 
-        att_db, att_freq = _filter_attenuation(H, freq, gain)
+        att_db, att_freq = _filter_attenuation(h, freq, gain)
         if att_db < min_att_db:
             att_freq *= Fs / 2
             warnings.warn('Attenuation at stop frequency %0.1fHz is only '
                           '%0.1fdB.' % (att_freq, att_db))
 
         # Make zero-phase filter function
-        B = np.abs(fft(H)).ravel()
+        H = np.abs(fft(h)).ravel()
 
         # Figure out if we should use CUDA
-        n_jobs, cuda_dict, B = setup_cuda_fft_multiply_repeated(n_jobs, B)
+        n_jobs, cuda_dict, H = setup_cuda_fft_multiply_repeated(n_jobs, H)
 
         if n_jobs == 1:
             for p in picks:
-                x[p] = _1d_fftmult_ext(x[p], B, extend_x, cuda_dict)
+                x[p] = _1d_fftmult_ext(x[p], H, extend_x, cuda_dict)
         else:
             parallel, p_fun, _ = parallel_func(_1d_fftmult_ext, n_jobs)
-            data_new = parallel(p_fun(x[p], B, extend_x, cuda_dict)
+            data_new = parallel(p_fun(x[p], H, extend_x, cuda_dict)
                                 for p in picks)
             for pp, p in enumerate(picks):
                 x[p] = data_new[pp]
@@ -340,9 +339,9 @@ def _filter(x, Fs, freq, gain, filter_length='10s', picks=None, n_jobs=1,
             # Gain at Nyquist freq: 1: make N EVEN, 0: make N ODD
             N += 1
 
-        H = firwin2(N, freq, gain)
+        h = firwin2(N, freq, gain)
 
-        att_db, att_freq = _filter_attenuation(H, freq, gain)
+        att_db, att_freq = _filter_attenuation(h, freq, gain)
         att_db += 6  # the filter is applied twice (zero phase)
         if att_db < min_att_db:
             att_freq *= Fs / 2
@@ -350,7 +349,7 @@ def _filter(x, Fs, freq, gain, filter_length='10s', picks=None, n_jobs=1,
                           '%0.1fdB. Increase filter_length for higher '
                           'attenuation.' % (att_freq, att_db))
 
-        x = _overlap_add_filter(x, H, zero_phase=True, picks=picks,
+        x = _overlap_add_filter(x, h, zero_phase=True, picks=picks,
                                 n_jobs=n_jobs)
 
     x.shape = orig_shape
@@ -740,9 +739,9 @@ def band_stop_filter(x, Fs, Fp1, Fp2, filter_length='10s',
                          'transition bandwidth (l_trans_bandwidth)' % Fs1)
 
     if method == 'fft':
-        freq = np.r_[0, Fp1, Fs1, Fs2, Fp2, Fs / 2]
-        gain = np.r_[1, np.ones_like(Fp1), np.zeros_like(Fs1),
-                     np.zeros_like(Fs2), np.ones_like(Fp2), 1]
+        freq = np.concatenate([[0], Fp1, Fs1, Fs2, Fp2, [Fs / 2]], -1)
+        gain = np.concatenate([[1], np.ones_like(Fp1), np.zeros_like(Fs1),
+                               np.zeros_like(Fs2), np.ones_like(Fp2), [1]], -1)
         order = np.argsort(freq)
         freq = freq[order]
         gain = gain[order]
@@ -1180,7 +1179,7 @@ def _mt_spectrum_remove(x, sfreq, line_freqs, notch_widths,
         indices_2 = [np.logical_and(freqs > lf - nw, freqs < lf + nw)
                      for lf, nw in zip(line_freqs, notch_widths)]
         indices_2 = np.where(np.any(np.array(indices_2), axis=0))[0]
-        indices = np.unique(np.r_[indices_1, indices_2])
+        indices = np.unique(np.concatenate([indices_1, indices_2]))
         rm_freqs = freqs[indices]
 
     fits = list()

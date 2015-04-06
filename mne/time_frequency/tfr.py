@@ -13,7 +13,7 @@ from math import sqrt
 from copy import deepcopy
 import numpy as np
 from scipy import linalg
-from scipy.fftpack import fftn, ifftn
+from scipy.fftpack import fft, ifft
 
 from ..fixes import partial
 from ..baseline import rescale
@@ -24,6 +24,7 @@ from ..io.pick import pick_info, pick_types
 from ..utils import check_fname
 from .multitaper import dpss_windows
 from .._hdf5 import write_hdf5, read_hdf5
+from ..cuda import fft_multiply_repeated
 
 
 def _get_data(inst, return_itc):
@@ -201,17 +202,19 @@ def _cwt_fft(X, Ws, mode="same"):
         if len(W) > n_times:
             raise ValueError('Wavelet is too long for such a short signal. '
                              'Reduce the number of cycles.')
-        fft_Ws[i] = fftn(W, [fsize])
+        fft_Ws[i] = fft(W, fsize)
 
+    if mode == "full":
+        tfr = np.zeros((n_freqs, fsize), dtype=np.complex128)
+    elif mode == "same" or mode == "valid":
+        tfr = np.zeros((n_freqs, n_times), dtype=np.complex128)
     for k, x in enumerate(X):
-        if mode == "full":
-            tfr = np.zeros((n_freqs, fsize), dtype=np.complex128)
-        elif mode == "same" or mode == "valid":
-            tfr = np.zeros((n_freqs, n_times), dtype=np.complex128)
-
-        fft_x = fftn(x, [fsize])
+        tfr.fill(0)
+        x_pad = np.concatenate((x.astype(np.complex128),
+                                np.zeros(fsize-len(x), np.complex128)))
         for i, W in enumerate(Ws):
-            ret = ifftn(fft_x * fft_Ws[i])[:n_times + W.size - 1]
+            ret = fft_multiply_repeated(fft_Ws[i], x_pad)
+            ret = ret[:n_times + W.size - 1]
             if mode == "valid":
                 sz = abs(W.size - n_times) + 1
                 offset = (n_times - sz) / 2

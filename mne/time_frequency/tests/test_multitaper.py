@@ -49,7 +49,6 @@ def test_multitaper_psd():
         freqs_ni, psd_ni, _ = ni.algorithms.spectral.multi_taper_psd(
             x, sfreq, adaptive=adaptive, jackknife=False)
 
-        # for some reason nitime returns n_times + 1 frequency points
-        # causing the value at 0 to be different
-        assert_array_almost_equal(psd[:, 1:], psd_ni[:, 1:-1], decimal=3)
-        assert_array_almost_equal(freqs, freqs_ni[:-1])
+        # we differ at DC and nyquist
+        assert_array_almost_equal(freqs, freqs_ni)
+        assert_array_almost_equal(psd[:, 1:-1], psd_ni[:, 1:-1], decimal=3)
