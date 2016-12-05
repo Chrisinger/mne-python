@@ -9,5 +9,6 @@ from .cluster_level import (permutation_cluster_test,
                             _st_mask_from_s_inds,
                             ttest_1samp_no_p,
                             summarize_clusters_stc)
-from .multi_comp import fdr_correction, bonferroni_correction
+from .multi_comp import (fdr_correction, bonferroni_correction,
+                         partial_conjunction)
 from .regression import linear_regression, linear_regression_raw

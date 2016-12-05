@@ -925,6 +925,7 @@ Statistics
 
    bonferroni_correction
    fdr_correction
+   partial_conjunction
    permutation_cluster_test
    permutation_cluster_1samp_test
    permutation_t_test
