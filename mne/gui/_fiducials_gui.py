@@ -28,7 +28,13 @@ from ._file_traits import (SurfaceSource, fid_wildcard, FiducialsSource,
                            MRISubjectSource, SubjectSelectorPanel)
 from ._viewer import (HeadViewController, PointObject, SurfaceObject,
                       headview_borders)
+
 defaults = DEFAULTS['coreg']
+
+
+def _mm_fmt(x):
+    """Format mm data."""
+    return '%0.5f' % x
 
 
 class MRIHeadWithFiducialsModel(HasPrivateTraits):
@@ -40,21 +46,17 @@ class MRIHeadWithFiducialsModel(HasPrivateTraits):
         MRI head surface points.
     tris : array (n_tris, 3)
         Triangles based on points.
-    lpa : array (1, 3)
-        Left peri-auricular point coordinates.
-    nasion : array (1, 3)
-        Nasion coordinates.
-    rpa : array (1, 3)
-        Right peri-auricular point coordinates.
+    fid : array (3, 3)
+        LPA, Nasion, and RPA coordinates in rows.
     """
 
     subject_source = Instance(MRISubjectSource, ())
     bem = Instance(SurfaceSource, ())
-    fid = Instance(FiducialsSource, ())
+    src = Instance(FiducialsSource, ())
 
-    fid_file = DelegatesTo('fid', 'file')
-    fid_fname = DelegatesTo('fid', 'fname')
-    fid_points = DelegatesTo('fid', 'points')
+    fid_file = DelegatesTo('src', 'file')
+    fid_fname = DelegatesTo('src', 'fname')
+    fid_points = DelegatesTo('src', 'points')
     subjects_dir = DelegatesTo('subject_source')
     subject = DelegatesTo('subject_source')
     subject_has_bem = DelegatesTo('subject_source')
@@ -62,19 +64,15 @@ class MRIHeadWithFiducialsModel(HasPrivateTraits):
     points = DelegatesTo('bem')
     norms = DelegatesTo('bem')
     tris = DelegatesTo('bem')
-    lpa = Array(float, (1, 3))
-    nasion = Array(float, (1, 3))
-    rpa = Array(float, (1, 3))
+    fid = Array(float, (3, 3))
 
     reset = Event(desc="Reset fiducials to the file.")
 
     # info
     can_save = Property(depends_on=['file', 'can_save_as'])
-    can_save_as = Property(depends_on=['lpa', 'nasion', 'rpa'])
-    can_reset = Property(depends_on=['file', 'fid.points', 'lpa', 'nasion',
-                                     'rpa'])
-    fid_ok = Property(depends_on=['lpa', 'nasion', 'rpa'], desc="All points "
-                      "are set")
+    can_save_as = Property(depends_on=['src'])
+    can_reset = Property(depends_on=['file', 'src.points', 'fid'])
+    fid_ok = Property(depends_on=['fid'], desc="All points are set")
     default_fid_fname = Property(depends_on=['subjects_dir', 'subject'],
                                  desc="the default file name for the "
                                  "fiducials fif file")
@@ -86,9 +84,7 @@ class MRIHeadWithFiducialsModel(HasPrivateTraits):
     @on_trait_change('fid_points')
     def reset_fiducials(self):  # noqa: D102
         if self.fid_points is not None:
-            self.lpa = self.fid_points[0:1]
-            self.nasion = self.fid_points[1:2]
-            self.rpa = self.fid_points[2:3]
+            self.fid = self.fid_points
 
     def save(self, fname=None):
         """Save the current fiducials to a file.
@@ -104,29 +100,23 @@ class MRIHeadWithFiducialsModel(HasPrivateTraits):
         if not fname:
             fname = self.default_fid_fname
 
-        dig = [{'kind': 1, 'ident': 1, 'r': np.array(self.lpa[0])},
-               {'kind': 1, 'ident': 2, 'r': np.array(self.nasion[0])},
-               {'kind': 1, 'ident': 3, 'r': np.array(self.rpa[0])}]
+        dig = [{'kind': 1, 'ident': 1, 'r': np.array(self.fid[0])},
+               {'kind': 1, 'ident': 2, 'r': np.array(self.fid[1])},
+               {'kind': 1, 'ident': 3, 'r': np.array(self.fid[2])}]
         write_fiducials(fname, dig, FIFF.FIFFV_COORD_MRI)
         self.fid_file = fname
 
     @cached_property
     def _get_can_reset(self):
-        if not self.fid_file:
+        if not self.fid_file or np.allclose(self.fid, self.src.points):
             return False
-        elif np.any(self.lpa != self.fid.points[0:1]):
-            return True
-        elif np.any(self.nasion != self.fid.points[1:2]):
-            return True
-        elif np.any(self.rpa != self.fid.points[2:3]):
-            return True
-        return False
+        return True
 
     @cached_property
     def _get_can_save_as(self):
-        can = not (np.all(self.nasion == self.lpa) or
-                   np.all(self.nasion == self.rpa) or
-                   np.all(self.lpa == self.rpa))
+        can = not (np.all(self.fid[1] == self.fid[0]) or
+                   np.all(self.fid[1] == self.fid[2]) or
+                   np.all(self.fid[0] == self.fid[2]))
         return can
 
     @cached_property
@@ -148,7 +138,7 @@ class MRIHeadWithFiducialsModel(HasPrivateTraits):
 
     @cached_property
     def _get_fid_ok(self):
-        return all(np.any(pt) for pt in (self.nasion, self.lpa, self.rpa))
+        return np.any(self.fid, axis=-1).all()
 
     def _reset_fired(self):
         self.reset_fiducials()
@@ -184,7 +174,7 @@ class MRIHeadWithFiducialsModel(HasPrivateTraits):
         # find fiducials file
         fid_files = _find_fiducials_files(subject, subjects_dir)
         if len(fid_files) == 0:
-            self.fid.reset_traits(['file'])
+            self.src.reset_traits(['file'])
             self.lock_fiducials = False
         else:
             self.fid_file = fid_files[0].format(subjects_dir=subjects_dir,
@@ -202,9 +192,7 @@ class FiducialsPanel(HasPrivateTraits):
 
     fid_file = DelegatesTo('model')
     fid_fname = DelegatesTo('model')
-    lpa = DelegatesTo('model')
-    nasion = DelegatesTo('model')
-    rpa = DelegatesTo('model')
+    fid = DelegatesTo('model')
     can_save = DelegatesTo('model')
     can_save_as = DelegatesTo('model')
     can_reset = DelegatesTo('model')
@@ -212,7 +200,7 @@ class FiducialsPanel(HasPrivateTraits):
     locked = DelegatesTo('model', 'lock_fiducials')
 
     set = Enum('LPA', 'Nasion', 'RPA')
-    current_pos = Array(float, (1, 3), editor=ArrayEditor(width=50))
+    current_pos = Array(float, (3, 3), editor=ArrayEditor(width=50))
 
     save_as = Button(label='Save As...')
     save = Button(label='Save')
@@ -226,8 +214,10 @@ class FiducialsPanel(HasPrivateTraits):
     # the layout of the dialog created
     view = View(VGroup(Item('fid_file', label='File'),
                        Item('fid_fname', show_label=False, style='readonly'),
-                       Item('set', style='custom', width=50),
-                       Item('current_pos', label='Pos', width=50),
+                       Item('current_pos', label='Pos', width=50,
+                            format_func=_mm_fmt),
+                       Item('set', style='custom', width=50,
+                            format_func=lambda x: x),
                        HGroup(Item('save', enabled_when='can_save',
                                    tooltip="If a filename is currently "
                                    "specified, save to that file, otherwise "
@@ -242,7 +232,7 @@ class FiducialsPanel(HasPrivateTraits):
 
     def __init__(self, *args, **kwargs):  # noqa: D102
         super(FiducialsPanel, self).__init__(*args, **kwargs)
-        self.sync_trait('lpa', self, 'current_pos', mutual=True)
+        self.sync_trait('fid', self, 'current_pos', mutual=True)
 
     def _reset_fid_fired(self):
         self.model.reset = True
@@ -287,12 +277,12 @@ class FiducialsPanel(HasPrivateTraits):
         if picker.actor is self.hsp_obj.surf.actor.actor:
             idxs = []
             idx = None
-            pt = [picker.pick_position]
+            pt = picker.pick_position
         elif self.hsp_obj.surf.actor.actor in picker.actors:
             idxs = [i for i in range(n_pos) if picker.actors[i] is
                     self.hsp_obj.surf.actor.actor]
             idx = idxs[-1]
-            pt = [picker.picked_positions[idx]]
+            pt = picker.picked_positions[idx]
         else:
             logger.debug("GUI: picked object other than MRI")
 
@@ -316,27 +306,13 @@ class FiducialsPanel(HasPrivateTraits):
                 line += " (<- also MRI mesh)"
             msg.append(line)
         logger.debug(os.linesep.join(msg))
-
-        if self.set == 'Nasion':
-            self.nasion = pt
-        elif self.set == 'LPA':
-            self.lpa = pt
-        elif self.set == 'RPA':
-            self.rpa = pt
-        else:
-            raise ValueError("set = %r" % self.set)
+        self.fid[dict(LPA=0, Nasion=1, RPA=2)[self.set]] = pt
+        self.fid = np.array(self.fid)  # trigger change notification
 
     @on_trait_change('set')
     def _on_set_change(self, obj, name, old, new):
-        self.sync_trait(old.lower(), self, 'current_pos', mutual=True,
-                        remove=True)
-        self.sync_trait(new.lower(), self, 'current_pos', mutual=True)
-        if new == 'Nasion':
-            self.headview.front = True
-        elif new == 'LPA':
-            self.headview.left = True
-        elif new == 'RPA':
-            self.headview.right = True
+        setattr(self.headview,
+                dict(LPA='left', Nasion='front', RPA='right')[new], True)
 
 
 # FiducialsPanel view that allows manipulating all coordinates numerically
@@ -371,9 +347,7 @@ class FiducialsFrame(HasTraits):
 
     mri_obj = Instance(SurfaceObject)
     point_scale = float(defaults['mri_fid_scale'])
-    lpa_obj = Instance(PointObject)
-    nasion_obj = Instance(PointObject)
-    rpa_obj = Instance(PointObject)
+    fid_obj = Instance(PointObject)
 
     def _headview_default(self):
         return HeadViewController(scene=self.scene, system='RAS')
@@ -417,9 +391,8 @@ class FiducialsFrame(HasTraits):
     def _init_plot(self):
         _toggle_mlab_render(self, False)
 
-        lpa_color = defaults['lpa_color']
-        nasion_color = defaults['nasion_color']
-        rpa_color = defaults['rpa_color']
+        fid_colors = [defaults['%s_color' % x]
+                      for x in ('lpa', 'nasion', 'rpa')]
 
         # bem
         color = defaults['mri_color']
@@ -429,21 +402,11 @@ class FiducialsFrame(HasTraits):
         self.panel.hsp_obj = self.mri_obj
 
         # fiducials
-        self.lpa_obj = PointObject(scene=self.scene, color=lpa_color,
-                                   point_scale=self.point_scale)
-        self.panel.sync_trait('lpa', self.lpa_obj, 'points', mutual=False)
-        self.sync_trait('point_scale', self.lpa_obj, mutual=False)
-
-        self.nasion_obj = PointObject(scene=self.scene, color=nasion_color,
-                                      point_scale=self.point_scale)
-        self.panel.sync_trait('nasion', self.nasion_obj, 'points',
-                              mutual=False)
-        self.sync_trait('point_scale', self.nasion_obj, mutual=False)
-
-        self.rpa_obj = PointObject(scene=self.scene, color=rpa_color,
-                                   point_scale=self.point_scale)
-        self.panel.sync_trait('rpa', self.rpa_obj, 'points', mutual=False)
-        self.sync_trait('point_scale', self.rpa_obj, mutual=False)
+        self.fid_obj = PointObject(scene=self.scene, color=fid_colors,
+                                   point_scale=self.point_scale,
+                                   indices=[0, 1, 2])
+        self.panel.sync_trait('fid', self.fid_obj, 'points', mutual=False)
+        self.sync_trait('point_scale', self.fid_obj, mutual=False)
 
         self.headview.left = True
         _toggle_mlab_render(self, True)

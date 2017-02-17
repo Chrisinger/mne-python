@@ -126,13 +126,33 @@ class Object(HasPrivateTraits):
     scene = Instance(MlabSceneModel, ())
     src = Instance(VTKDataSource)
 
-    # This should be Tuple, but it is broken on Anaconda as of 2016/12/16
-    color = RGBColor()
-    point_scale = Float(10, label='Point Scale')
+    color = RGBColor((1., 1., 1.))
+    colors = Array(float, shape=(None, 3))  # for indexed color objects
+    indices = Array(float, shape=(None,))
     opacity = Range(low=0., high=1., value=1.)
     visible = Bool(True)
 
-    @on_trait_change('trans,points')
+    @on_trait_change('colors')
+    def _update_colors(self):
+        """Update the indexed colors."""
+        if not self.glyph:
+            print('%s: Skipping color update, no Glyph' % (id(self),))
+            return
+        if len(self.colors) < 2:
+            print('%s: Skipping color update, len(colors) == %d' % (id(self), len(self.colors)))
+            return
+        print('%s: Updating %d colors' % (id(self), len(self.colors),))
+        colors = np.round(255 * self.colors).astype(int)
+        colors = np.concatenate(
+            [colors, np.ones((len(colors), 1), int) * 255], -1)
+        _toggle_mlab_render(self, False)
+        self.glyph.glyph.color_mode = 'color_by_scalar'
+        self.glyph.module_manager.scalar_lut_manager.lut.table = colors
+        self.glyph.module_manager.scalar_lut_manager.data_range = \
+            [-0.5, len(colors) - 0.5]
+        _toggle_mlab_render(self, True)
+
+    @on_trait_change('trans,points,indices')
     def _update_points(self):
         """Update the location of the plotted points"""
         if not hasattr(self.src, 'data'):
@@ -155,18 +175,30 @@ class Object(HasPrivateTraits):
         else:
             pts = self.points
 
+        _toggle_mlab_render(self, False)
         self.src.data.points = pts
+        if len(self.indices) == len(pts):
+            print('%s: Updating %d points with indices' % (id(self), len(pts),))
+            self.src.mlab_source.dataset.point_data.scalars = self.indices
+        else:
+            print('%s: Skipping update, mismatch: %s != %s' % (id(self), self.indices.shape, pts.shape))
+        self.src.update()
+        _toggle_mlab_render(self, True)
         return True
 
 
 class PointObject(Object):
-    """Represent a group of individual points in a mayavi scene."""
+    """Represent a group of individual points in a mayavi scene.
+
+    This object also supports indexed color through "indices" and "colors".
+    """
 
     label = Bool(False, enabled_when='visible')
     text3d = List
 
     glyph = Instance(Glyph)
     resolution = Int(8)
+    point_scale = Float(10, label='Point Scale')
 
     view = View(HGroup(Item('visible', show_label=False),
                        Item('color', show_label=False),
@@ -208,7 +240,7 @@ class PointObject(Object):
             fig = self.scene.mayavi_scene
             for i, pt in enumerate(np.array(self.src.data.points)):
                 x, y, z = pt
-                t = text3d(x, y, z, ' %i' % i, scale=.01, color=self.rgbcolor,
+                t = text3d(x, y, z, ' %i' % i, scale=.01, color=self.color,
                            figure=fig)
                 self.text3d.append(t)
         _toggle_mlab_render(self, True)
@@ -230,14 +262,18 @@ class PointObject(Object):
 
         _toggle_mlab_render(self, False)
         x, y, z = self.points.T
-        scatter = pipeline.scalar_scatter(x, y, z)
         fig = self.scene.mayavi_scene if not _testing_mode() else None
-        glyph = pipeline.glyph(scatter, color=self.color,
-                               figure=fig,
+        scatter = pipeline.scalar_scatter(x, y, z, np.arange(len(x)))
+        glyph = pipeline.glyph(scatter, color=self.color, figure=fig,
                                scale_factor=self.point_scale, opacity=1.,
                                resolution=self.resolution)
+        glyph.glyph.glyph_source.glyph_source.center = [0, 0, 0]
+        glyph.actor.property.backface_culling = True
+        glyph.glyph.scale_mode = 'data_scaling_off'
         self.src = scatter
         self.glyph = glyph
+        self._update_colors()
+        self._update_points()
 
         self.sync_trait('point_scale', self.glyph.glyph.glyph, 'scale_factor')
         self.sync_trait('color', self.glyph.actor.property, mutual=False)
@@ -246,12 +282,9 @@ class PointObject(Object):
         self.on_trait_change(self._update_points, 'points')
         _toggle_mlab_render(self, True)
 
-#         self.scene.camera.parallel_scale = _scale
-
     def _resolution_changed(self, new):
         if not self.glyph:
             return
-
         self.glyph.glyph.glyph_source.glyph_source.phi_resolution = new
         self.glyph.glyph.glyph_source.glyph_source.theta_resolution = new
 

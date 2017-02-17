@@ -265,12 +265,8 @@ class DigSource(HasPrivateTraits):
                        "(list of dict)")
     fid_points = Property(depends_on='fid_dig', desc="Fiducial points {ident: "
                           "point} dict}")
-    lpa = Property(depends_on='fid_points', desc="LPA coordinates (1 x 3 "
-                   "array)")
-    nasion = Property(depends_on='fid_points', desc="Nasion coordinates (1 x "
-                      "3 array)")
-    rpa = Property(depends_on='fid_points', desc="RPA coordinates (1 x 3 "
-                   "array)")
+    fid = Property(depends_on='fid_points', desc="LPA, Nasion, RPA "
+                   "coordinates (3 x 3)")
 
     # EEG
     eeg_dig = Property(depends_on='inst', desc="EEG points (list of dict)")
@@ -351,25 +347,14 @@ class DigSource(HasPrivateTraits):
         return dict((d['ident'], d) for d in self.fid_dig)
 
     @cached_property
-    def _get_nasion(self):
+    def _get_fid(self):
         if self.fid_points:
-            return self.fid_points[FIFF.FIFFV_POINT_NASION]['r'][None, :]
+            return np.array([self.fid_points[x]['r']
+                             for x in (FIFF.FIFFV_POINT_LPA,
+                                       FIFF.FIFFV_POINT_NASION,
+                                       FIFF.FIFFV_POINT_RPA)])
         else:
-            return np.zeros((1, 3))
-
-    @cached_property
-    def _get_lpa(self):
-        if self.fid_points:
-            return self.fid_points[FIFF.FIFFV_POINT_LPA]['r'][None, :]
-        else:
-            return np.zeros((1, 3))
-
-    @cached_property
-    def _get_rpa(self):
-        if self.fid_points:
-            return self.fid_points[FIFF.FIFFV_POINT_RPA]['r'][None, :]
-        else:
-            return np.zeros((1, 3))
+            return np.zeros((3, 3))  # XXX probably should be nan
 
     @cached_property
     def _get_eeg_points(self):
