@@ -85,6 +85,8 @@ Changelog
 
     - Add function :func:`mne.channels.get_builtin_montages` to list all built-in montages by `Clemens Brunner`_
 
+    - Add support for :class:`numpy.random.RandomState` argument to ``seed`` in :mod:`statistical clustering functions <mne.stats>` and better documentation of exact 1-sample tests by `Eric Larson`_
+
 BUG
 ~~~
 
